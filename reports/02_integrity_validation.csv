@@ -1,0 +1,16 @@
+﻿controle,problemes
+Unicite Customers (customer_id),0
+Unicite Orders (order_id),0
+"Unicite Order Items (order_id, order_item_id)",0
+"Unicite Payments (order_id, payment_sequential)",0
+Unicite Reviews (review_id),814
+Orders -> Customers,0
+Order Items -> Orders,0
+Payments -> Orders,0
+Reviews -> Orders,0
+Notes des avis entre 1 et 5,0
+Dates invalides - order_purchase_timestamp,0
+Dates invalides - order_approved_at,0
+Dates invalides - order_delivered_carrier_date,0
+Dates invalides - order_delivered_customer_date,0
+Dates invalides - order_estimated_delivery_date,0

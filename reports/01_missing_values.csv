@@ -1,0 +1,6 @@
+﻿fichier,colonne,valeurs_manquantes,pourcentage
+olist_orders_dataset.csv,order_approved_at,160,0.16
+olist_orders_dataset.csv,order_delivered_carrier_date,1783,1.79
+olist_orders_dataset.csv,order_delivered_customer_date,2965,2.98
+olist_order_reviews_dataset.csv,review_comment_title,87656,88.34
+olist_order_reviews_dataset.csv,review_comment_message,58247,58.7

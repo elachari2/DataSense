@@ -1,0 +1,6 @@
+﻿fichier,nombre_lignes,nombre_colonnes,lignes_dupliquees,valeurs_manquantes_total
+olist_customers_dataset.csv,99441,5,0,0
+olist_orders_dataset.csv,99441,8,0,4908
+olist_order_items_dataset.csv,112650,7,0,0
+olist_order_payments_dataset.csv,103886,5,0,0
+olist_order_reviews_dataset.csv,99224,7,0,145903
