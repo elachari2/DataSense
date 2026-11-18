@@ -28,7 +28,7 @@ if missing:
     )
 
 database_url = URL.create(
-    drivername="postgresql+psycopg",
+    drivername="postgresql+psycopg2",
     username=os.getenv("DB_USER"),
     password=os.getenv("DB_PASSWORD"),
     host=os.getenv("DB_HOST"),
