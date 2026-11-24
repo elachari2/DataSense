@@ -1,5 +1,8 @@
+
 """Backend services package for DataSense."""
+
 from .llm_service import GeminiLLMService, LLMResponse, get_llm_service
+
 from .schema_linking import (
     SchemaInspector,
     SchemaLinker,
@@ -8,9 +11,19 @@ from .schema_linking import (
     ColumnMetadata,
     ForeignKeyMetadata,
     SchemaLinkingResult,
-    get_schema_linker
+    get_schema_linker,
 )
-from .nl2sql_service import NL2SQLService, NL2SQLResponse, get_nl2sql_service
+
+from .nl2sql_service import (
+    NL2SQLService,
+    NL2SQLResponse,
+    get_nl2sql_service,
+)
+
+from .semantic_search_service import (
+    SemanticSearchService,
+    get_semantic_search_service,
+)
 
 __all__ = [
     "GeminiLLMService",
@@ -27,4 +40,6 @@ __all__ = [
     "NL2SQLService",
     "NL2SQLResponse",
     "get_nl2sql_service",
+    "SemanticSearchService",
+    "get_semantic_search_service",
 ]
