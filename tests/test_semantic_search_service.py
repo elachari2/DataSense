@@ -42,6 +42,14 @@ class FakeEngine:
         return FakeConnection()
 
 
+class ScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar(self):
+        return self.value
+
+
 def test_search_returns_expected_results():
     service = SemanticSearchService(
         engine=FakeEngine(),
@@ -55,6 +63,40 @@ def test_search_returns_expected_results():
     assert results[0]["order_id"] == "order_001"
     assert results[0]["review_text"] == "A entrega chegou com muito atraso."
     assert results[0]["similarity"] == pytest.approx(0.82)
+
+
+def test_readiness_checks_table_embeddings_and_vector_dimension():
+    from unittest.mock import MagicMock
+
+    from backend.services.semantic_search_service import SemanticSearchReadiness
+
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
+    connection.execute.side_effect = [
+        ScalarResult("public.reviews_semantic"),
+        ScalarResult("vector(384)"),
+        ScalarResult(True),
+    ]
+    readiness = SemanticSearchService(engine=engine).readiness()
+
+    assert readiness == SemanticSearchReadiness(True, True, 384)
+    assert readiness.ready is True
+
+
+def test_readiness_reports_missing_table_without_querying_embeddings():
+    from unittest.mock import MagicMock
+
+    from backend.services.semantic_search_service import SemanticSearchReadiness
+
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value = ScalarResult(None)
+
+    readiness = SemanticSearchService(engine=engine).readiness()
+
+    assert readiness == SemanticSearchReadiness(False, False, None)
+    assert readiness.ready is False
+    connection.execute.assert_called_once()
 
 
 def test_search_rejects_empty_question():

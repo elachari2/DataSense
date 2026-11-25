@@ -12,7 +12,11 @@ from typing import Optional, Dict, Any, List
 import pandas as pd
 
 from backend.config.settings import get_settings, Settings
-from backend.services.llm_service import GeminiLLMService, get_llm_service
+from backend.services.llm_service import (
+    GeminiLLMService,
+    gemini_error_message,
+    get_llm_service,
+)
 from backend.services.schema_linking import SchemaLinker, SchemaLinkingResult, get_schema_linker
 from backend.database.query_executor import QueryExecutor, QueryResult, get_query_executor
 
@@ -71,6 +75,11 @@ class NL2SQLResponse:
     llm_duration_seconds: float = 0.0
     total_duration_seconds: float = 0.0
     error_message: Optional[str] = None
+    error_code: Optional[str] = None
+    intent: str = "sql"
+    answer: Optional[str] = None
+    semantic_results: Optional[List[Dict[str, Any]]] = None
+    provider_status: Optional[int] = None
 
     @property
     def has_data(self) -> bool:
@@ -166,6 +175,7 @@ Generate the JSON response containing the exact PostgreSQL SQL query.
         )
 
         if not llm_response.success:
+            error_code = llm_response.error_code or "GEMINI_REQUEST_ERROR"
             return NL2SQLResponse(
                 question=question,
                 status="error",
@@ -173,7 +183,12 @@ Generate the JSON response containing the exact PostgreSQL SQL query.
                 schema_linking=linking_result,
                 llm_duration_seconds=llm_response.duration_seconds,
                 total_duration_seconds=time.time() - start_time,
-                error_message=llm_response.error
+                error_message=gemini_error_message(
+                    error_code,
+                    llm_response.provider_status,
+                ),
+                error_code=error_code,
+                provider_status=llm_response.provider_status,
             )
 
         # 4. Parse Structured JSON
@@ -219,8 +234,8 @@ Generate the JSON response containing the exact PostgreSQL SQL query.
         sql = sql.strip().rstrip(";")
 
         # 5. Validate SQL
-        is_valid, val_err = self.executor.validate_sql(sql)
-        if not is_valid:
+        validation = self.executor.validate_query(sql)
+        if not validation.valid or validation.sql is None:
             return NL2SQLResponse(
                 question=question,
                 status="security_rejected",
@@ -230,8 +245,11 @@ Generate the JSON response containing the exact PostgreSQL SQL query.
                 schema_linking=linking_result,
                 llm_duration_seconds=llm_response.duration_seconds,
                 total_duration_seconds=time.time() - start_time,
-                error_message=f"SQL Validation Failed: {val_err}"
+                error_message=f"SQL Validation Failed: {validation.error_message or 'No validated query was produced.'}",
+                error_code=validation.error_code.value if validation.error_code else "UNSAFE_QUERY_STRUCTURE",
             )
+
+        sql = validation.sql
 
         # 6. Execute SQL
         exec_result: Optional[QueryResult] = None
@@ -250,7 +268,8 @@ Generate the JSON response containing the exact PostgreSQL SQL query.
             schema_linking=linking_result,
             llm_duration_seconds=llm_response.duration_seconds,
             total_duration_seconds=total_duration,
-            error_message=exec_result.error_message if exec_result and not exec_result.success else None
+            error_message=exec_result.error_message if exec_result and not exec_result.success else None,
+            error_code=exec_result.error_code if exec_result and not exec_result.success else None
         )
 
 

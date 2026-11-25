@@ -24,6 +24,10 @@ from .semantic_search_service import (
     SemanticSearchService,
     get_semantic_search_service,
 )
+from .question_orchestrator import (
+    QuestionOrchestrator,
+    get_question_orchestrator,
+)
 
 __all__ = [
     "GeminiLLMService",
@@ -42,4 +46,6 @@ __all__ = [
     "get_nl2sql_service",
     "SemanticSearchService",
     "get_semantic_search_service",
+    "QuestionOrchestrator",
+    "get_question_orchestrator",
 ]

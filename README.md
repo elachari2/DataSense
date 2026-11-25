@@ -2,7 +2,7 @@
 
 DataSense est une plateforme analytique avancée permettant d'interroger une base de données e-commerce relationnelle (**Olist**) en langage naturel grâce à l'intelligence artificielle (**Google Gemini API**) et **PostgreSQL**.
 
-L'application transforme automatiquement les questions posées en français ou en anglais en requêtes SQL PostgreSQL valides, les sécurise, les exécute sur la base de données, et restitue les résultats sous forme tabulaire et graphique au sein d'une interface conversationnelle **Streamlit**.
+L'application route les questions posées en français ou en anglais vers le pipeline SQL sécurisé, la recherche sémantique des avis clients, ou les deux. Gemini synthétise uniquement les résultats fournis, restitués dans l'interface conversationnelle **Streamlit**.
 
 ---
 
@@ -10,7 +10,7 @@ L'application transforme automatiquement les questions posées en français ou e
 
 ```
 DataSense/
-├── app.py                              # Application interactive Streamlit (NL2SQL + Profilage CSV)
+├── app.py                              # Assistant SQL/sémantique et profilage CSV
 ├── docker-compose.yml                  # Conteneur PostgreSQL 16 avec extension pgvector (port 5544)
 ├── requirements.txt                    # Dépendances Python déclarées
 ├── .env.example                        # Modèle de variables d'environnement
@@ -20,22 +20,27 @@ DataSense/
 │   ├── database/
 │   │   └── query_executor.py           # Exécution SQL sécurisée, transactions READ ONLY, timeouts
 │   └── services/
-│       ├── llm_service.py              # Intégration officielle SDK google-genai, backoff & gestion 429
+│       ├── llm_service.py              # Appels Gemini centralisés, fallback, reprise bornée et circuit breaker
 │       ├── schema_linking.py           # Introspection dynamique SQLAlchemy & Schema Linking
-│       └── nl2sql_service.py           # Pipeline complet NL2SQL (Prompts, Génération, Validation, Exécution)
+│       ├── nl2sql_service.py           # Pipeline SQL (génération, validation, exécution)
+│       ├── semantic_search_service.py   # Recherche pgvector des commentaires clients
+│       └── question_orchestrator.py     # Routage Gemini SQL / sémantique / mixte
 ├── data/
 │   ├── evaluation/
 │   │   └── questions.json              # Benchmark de 30 questions de référence (FR & EN)
 │   └── test_orders.csv                 # Données de test initiales
 ├── reports/
 │   └── baseline_a_results.json         # Rapport automatisé de performance de la Baseline A
+├── docs/
+│   └── RECHERCHE_SEMANTIQUE.md         # Routage, schéma et préparation des avis vectoriels
 ├── scripts/
 │   ├── evaluate_baseline_a.py          # Script d'évaluation automatisé (taux de succès, exactitude, temps)
 │   ├── seed_demo_data.py               # Générateur de données réalistes d'évaluation
-│   └── 01_ à 09_*.py                   # Scripts Data Engineering & Sémantique (Responsable A)
+│   └── 01_ à 10_*.py                   # Scripts Data Engineering & Sémantique
 ├── sql/
 │   ├── 01_analyses_metier.sql          # Requêtes SQL analytiques de référence
-│   └── 05_create_schema.sql            # Script DDL de création des 5 tables relationnelles
+│   ├── 05_create_schema.sql            # Script DDL de création des 5 tables relationnelles
+│   └── 06_create_reviews_semantic.sql  # Table et index pgvector pour les avis
 ├── src/
 │   └── db.py                           # Connecteur SQLAlchemy initial et test de connectivité
 └── tests/                              # Suite de tests automatisés pytest
@@ -44,6 +49,8 @@ DataSense/
     ├── test_schema_linking.py
     ├── test_query_executor.py
     ├── test_nl2sql_service.py
+    ├── test_semantic_search_service.py
+    ├── test_question_orchestrator.py
     └── test_baseline_evaluation.py
 ```
 
@@ -87,10 +94,19 @@ DB_PASSWORD=postgres
 # Configuration LLM Gemini
 LLM_PROVIDER=gemini
 LLM_API_KEY=VOTRE_CLE_API_GEMINI_ICI
-LLM_MODEL=gemini-3.1-flash-lite
+GEMINI_PRIMARY_MODEL=gemini-3.1-flash-lite
+GEMINI_FALLBACK_MODELS=gemini-3.5-flash-lite,gemini-3.6-flash
+GEMINI_FALLBACK_ENABLED=true
+GEMINI_MAX_RETRIES_PER_MODEL=1
+GEMINI_MODEL_COOLDOWN_SECONDS=60
+GEMINI_DAILY_QUOTA_COOLDOWN_SECONDS=86400
+GEMINI_MAX_RETRY_DELAY_SECONDS=2
+LLM_TIMEOUT_SECONDS=30
 LLM_TEMPERATURE=0.0
 LLM_MAX_OUTPUT_TOKENS=1024
 ```
+
+`LLM_MODEL` reste accepté comme nom historique si `GEMINI_PRIMARY_MODEL` n'est pas défini. Ne mettez jamais une clé API dans le dépôt.
 
 ### Étape 3 : Démarrer la base de données PostgreSQL
 
@@ -104,6 +120,10 @@ docker exec -it datasense_db psql -U postgres -d datasense -c "CREATE EXTENSION 
 # Vérifier la connexion
 python -m src.db
 ```
+
+Le port PostgreSQL `5544` est publié uniquement sur `127.0.0.1` pour le
+développement local; ne l'exposez pas sur une interface réseau avec le compte
+superutilisateur de démonstration.
 
 ### Étape 4 : Initialiser le schéma et les données de test
 
@@ -120,34 +140,47 @@ python scripts/seed_demo_data.py
 ## 4. Démarrage de l'Application Streamlit
 
 ```powershell
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 L'application s'ouvre sur `http://localhost:8501` et propose :
-1. **Assistant NL2SQL (Olist) :** Saisie libre de questions en français ou en anglais, exemples rapides pré-configurés, affichage du SQL généré, métriques de temps de réponse, tableau interactif et visualisation graphique automatique.
-2. **Import & Profilage CSV :** Outil de diagnostic rapide pour inspecter n'importe quel fichier CSV local.
+1. **Assistant conversationnel :** Posez vos questions en français ou en anglais. Le backend existant route les demandes vers SQL, la recherche sémantique d'avis ou les deux. Les réponses, tableaux, commentaires sources et graphiques pertinents sont affichés dans la conversation.
+2. **Historique de session :** Les échanges restent disponibles pendant la session Streamlit; « Nouvelle conversation » les efface. Ils ne sont pas persistés dans PostgreSQL.
+3. **Import & Profilage CSV :** Outil de diagnostic local pour inspecter un CSV; le fichier n'est pas envoyé au pipeline de questions.
+
+Le serveur Streamlit est configuré pour écouter uniquement sur `127.0.0.1`.
+Ne remplacez pas cette adresse par une interface réseau avant d'avoir mis en
+place une authentification et une autorisation adaptées aux données clients.
+
+Pour les résultats tabulaires, le sélecteur de visualisation ne propose que les graphiques compatibles avec les colonnes retournées. Les erreurs destinées à l'utilisateur ne divulguent pas les détails de connexion ou les erreurs internes.
 
 ---
 
 ## 5. Exécution des Tests Automatisés
 
-La suite de 30 tests unitaires et d'intégration couvre l'intégralité du pipeline backend :
+Lancer les tests unitaires et les tests d'interface Streamlit avec des services simulés :
 
 ```powershell
-pytest -v
+python -m pytest -q
 ```
 
-Tests inclus :
-- `test_settings.py` : Validation de la configuration et des variables d'environnement.
-- `test_query_executor.py` : Contrôle de sécurité (rejet des injections `DROP`, `DELETE`, `UPDATE`, `INSERT`, multi-requêtes).
-- `test_schema_linking.py` : Introspection dynamique de PostgreSQL et détection des tables/colonnes/jointures.
-- `test_llm_service.py` : Validation du client Gemini et gestion des erreurs/quotas.
-- `test_nl2sql_service.py` : Pipeline complet de traduction langage naturel vers SQL.
-- `test_baseline_evaluation.py` : Algorithme de comparaison d'équivalence de résultats.
+Les tests d'interface se trouvent dans `tests/test_app.py`; ils utilisent `streamlit.testing.v1.AppTest` et des mocks, sans appeler Gemini ni modifier une base réelle. Le test PostgreSQL de timeout est opt-in et nécessite une base de test configurée avec `DATASENSE_TEST_DATABASE_URL`. Les tests qui utilisent la configuration locale de la base doivent être lancés uniquement avec une base de test.
+
+Les tests du fallback Gemini sont simulés et ne vérifient ni la disponibilité live des modèles ni les quotas du projet :
+
+```powershell
+python -m pytest -q tests/test_llm_service.py tests/test_settings.py tests/test_nl2sql_service.py tests/test_question_orchestrator.py tests/test_app.py
+```
+
+Le fonctionnement, les limites de quota et le test live optionnel sont détaillés dans [`docs/GEMINI_MODEL_FALLBACK.md`](docs/GEMINI_MODEL_FALLBACK.md).
 
 ---
 
-## 6. Banc d'Évaluation de la Baseline A (30 questions étalons)
+## 6. Sécurité des requêtes SQL
+
+Les requêtes PostgreSQL générées sont analysées avec SQLGlot avant exécution. La politique de validation, les limites, les fonctions autorisées et les protections PostgreSQL sont décrites dans [`docs/SQL_SECURITY.md`](docs/SQL_SECURITY.md).
+
+## 7. Banc d'Évaluation de la Baseline A (30 questions étalons)
 
 Pour mesurer objectivement les performances du moteur NL2SQL :
 
@@ -166,13 +199,22 @@ Les résultats détaillés par question sont consignés dans `reports/baseline_a
 
 ---
 
-## 7. Limitations Connues & Feuille de Route Sprint 4
+## 8. Recherche sémantique des avis clients
 
-### Limitations actuelles (Baseline A) :
-- Pas de recherche sémantique vectorielle sur les commentaires textuels libres (réservé à Baseline B / Sprint 4).
-- Seuil de débit Free Tier fixé à 15 requêtes/minute (géré automatiquement avec temporisation).
+L'orchestrateur classe les demandes en SQL, sémantique ou mixtes avec une réponse JSON Gemini validée. Les demandes SQL continuent d'utiliser `NL2SQLService`; les avis sont recherchés via le `SemanticSearchService` existant, avec au plus cinq commentaires transmis à Gemini. Le texte des avis est traité comme donnée non fiable, et non comme instruction. La Baseline A d'évaluation demeure un benchmark NL2SQL et ne mesure pas la qualité de la recherche d'avis.
 
-### Travaux prévus pour le Sprint 4 :
-- Intégration de la recherche sémantique vectorielle (`reviews_semantic` via `pgvector` et MiniLM).
-- Validation AST avancée via `sqlglot`.
-- Pipeline RAG hybride combinant NL2SQL et recherche d'avis similaires.
+Le service attend `public.reviews_semantic` avec des embeddings de 384 dimensions. Après avoir créé `order_reviews` et configuré l'accès PostgreSQL, initialiser le schéma (commande non destructive; nécessite les droits d'extension si `vector` n'est pas déjà activée) :
+
+```powershell
+Get-Content .\sql\06_create_reviews_semantic.sql | docker compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres -d datasense
+```
+
+La génération d'embeddings est une opération d'écriture distincte qui insère les commentaires manquants; lancez-la explicitement seulement lorsque les données et la base cible ont été vérifiées :
+
+```powershell
+python scripts/08_generate_embeddings.py
+```
+
+Exemples : « Que pensent les clients de la livraison ? » ou « Quel produit est le plus vendu et que disent les avis associés ? ». Les tests du service sémantique utilisent des mocks. Le test PostgreSQL opt-in de l'exécuteur SQL vérifie le mode read-only et le timeout via `DATASENSE_TEST_DATABASE_URL`; il ne vérifie pas la qualité de la recherche sémantique. Les tests NL2SQL existants peuvent utiliser la base configurée par l'application : lancez toute la suite uniquement avec une base de test.
+
+Les détails du routage, des erreurs, du schéma et des commandes sont dans [`docs/RECHERCHE_SEMANTIQUE.md`](docs/RECHERCHE_SEMANTIQUE.md).

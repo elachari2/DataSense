@@ -1,7 +1,13 @@
 """Tests for centralized configuration and settings."""
 
 import os
-from backend.config.settings import Settings, get_settings, DatabaseSettings, LLMSettings
+from backend.config.settings import (
+    get_settings,
+    DatabaseSettings,
+    LLMSettings,
+    _env_bool,
+    parse_model_candidates,
+)
 
 
 def test_settings_singleton():
@@ -22,3 +28,18 @@ def test_llm_settings():
     assert llm.provider == "gemini"
     assert llm.model is not None
     assert llm.temperature == 0.0
+
+
+def test_fallback_model_configuration_preserves_order_and_removes_duplicates():
+    assert parse_model_candidates(
+        " gemini-a,gemini-b,gemini-a, ,gemini-c "
+    ) == ("gemini-a", "gemini-b", "gemini-c")
+
+
+def test_fallback_model_configuration_can_be_empty():
+    assert parse_model_candidates("") == ()
+
+
+def test_fallback_enabled_configuration_is_parsed(monkeypatch):
+    monkeypatch.setenv("GEMINI_FALLBACK_ENABLED", "false")
+    assert _env_bool("GEMINI_FALLBACK_ENABLED", True) is False

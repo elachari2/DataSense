@@ -1,164 +1,430 @@
+import logging
+
 import pandas as pd
 import streamlit as st
-import time
 
-from src.db import test_connection
-from backend.services.nl2sql_service import get_nl2sql_service
-from backend.services.llm_service import get_llm_service
 from backend.config.settings import get_settings
-
-st.set_page_config(
-    page_title="DataSense - Assistant NL2SQL & Analytics",
-    page_icon="📊",
-    layout="wide"
+from backend.services.llm_service import (
+    gemini_error_message,
+    get_llm_service,
 )
+from backend.services.question_orchestrator import get_question_orchestrator
+from backend.services.semantic_search_service import get_semantic_search_service
+from src.db import test_connection
 
+
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
-st.title("DataSense — Intelligent Data Analytics")
-st.caption("Interrogez la base de données e-commerce Olist en langage naturel grâce à l'IA (Gemini + PostgreSQL)")
 
-# =====================================================
-# SIDEBAR : ÉTAT DU SYSTÈME & MODÈLE
-# =====================================================
-with st.sidebar:
-    st.header("État du système")
+st.set_page_config(
+    page_title="DataSense - Assistant Olist",
+    page_icon="📊",
+    layout="wide",
+)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _database_status():
     try:
-        version, has_vector = test_connection()
-        st.success("PostgreSQL connecté")
-        st.write("pgvector :", "activé" if has_vector else "absent")
-        st.caption(f"Host: {settings.db.host}:{settings.db.port} ({settings.db.name})")
-    except Exception as e:
-        st.error(f"Connexion impossible : {e}")
+        _, has_vector = test_connection()
+    except Exception as error:
+        logger.warning(
+            "Database health check failed: exception=%s",
+            type(error).__name__,
+        )
+        return False, False, None
 
-    st.divider()
-    st.header("Modèle LLM")
-    st.write(f"Fournisseur : **{settings.llm.provider.upper()}**")
-    st.write(f"Modèle : `{settings.llm.model}`")
-    
-    if st.button("Tester la connexion API Gemini"):
-        with st.spinner("Test de connectivité..."):
-            llm_service = get_llm_service()
-            status = llm_service.test_connectivity()
-            if status["success"]:
-                st.success(f"API Gemini OK ({status['duration_seconds']}s)")
-            else:
-                st.error(f"Échec API : {status.get('error')}")
+    if not has_vector:
+        return True, False, None
 
-# =====================================================
-# ONGLETS PRINCIPAUX : NL2SQL & PROFILAGE CSV
-# =====================================================
-tab_nl2sql, tab_csv = st.tabs(["💬 Assistant NL2SQL (Olist)", "📁 Import & Profilage CSV"])
+    try:
+        readiness = get_semantic_search_service().readiness()
+    except Exception as error:
+        logger.warning(
+            "Semantic readiness check failed: exception=%s",
+            type(error).__name__,
+        )
+        return True, True, None
+    return True, True, readiness
 
-with tab_nl2sql:
-    st.header("Posez une question sur la base Olist")
-    st.write("Exprimez votre besoin analytique en français ou en anglais :")
 
-    if "nl2sql_question" not in st.session_state:
-        st.session_state.nl2sql_question = ""
+def _render_chart(data: pd.DataFrame, message_index: int) -> None:
+    if len(data) < 2:
+        return
 
-    # Exemples rapides
-    col_ex1, col_ex2, col_ex3, col_ex4 = st.columns(4)
-    if col_ex1.button("Delivered orders in 2018?"):
-        st.session_state.nl2sql_question = "How many orders were delivered in 2018?"
-        st.rerun()
-    if col_ex2.button("Total revenue?"):
-        st.session_state.nl2sql_question = "What is the total revenue?"
-        st.rerun()
-    if col_ex3.button("Average review score?"):
-        st.session_state.nl2sql_question = "What is the average review score?"
-        st.rerun()
-    if col_ex4.button("Orders by status?"):
-        st.session_state.nl2sql_question = "What is the distribution of orders by status?"
-        st.rerun()
+    numeric_columns = [
+        column
+        for column in data.columns
+        if pd.api.types.is_numeric_dtype(data[column])
+        and not pd.api.types.is_bool_dtype(data[column])
+    ]
+    date_columns = [
+        column
+        for column in data.columns
+        if pd.api.types.is_datetime64_any_dtype(data[column])
+    ]
+    category_columns = [
+        column
+        for column in data.columns
+        if column not in numeric_columns and column not in date_columns
+        and data[column].nunique(dropna=True) <= 30
+    ]
 
-    # Champ de saisie
-    user_query = st.text_input(
-        "Votre question :",
-        key="nl2sql_question",
-        placeholder="Ex: Combien de commandes ont été livrées en 2018 ? ou What is the total revenue?"
+    chart_types = []
+    if category_columns and numeric_columns:
+        chart_types.append("Barres")
+    if date_columns and numeric_columns:
+        chart_types.append("Courbe")
+    if len(numeric_columns) >= 2:
+        chart_types.append("Nuage de points")
+    if not chart_types:
+        return
+
+    st.subheader("Visualisation")
+    chart_type = st.selectbox(
+        "Type de graphique",
+        ["Aucun"] + chart_types,
+        key=f"chart_type_{message_index}",
+    )
+    if chart_type == "Aucun":
+        return
+
+    if chart_type == "Barres":
+        x_column = st.selectbox(
+            "Dimension",
+            category_columns,
+            key=f"chart_x_{message_index}",
+        )
+        y_column = st.selectbox(
+            "Mesure",
+            numeric_columns,
+            key=f"chart_y_{message_index}",
+        )
+        st.bar_chart(data, x=x_column, y=y_column)
+    elif chart_type == "Courbe":
+        x_column = st.selectbox(
+            "Axe temporel",
+            date_columns,
+            key=f"chart_x_{message_index}",
+        )
+        y_column = st.selectbox(
+            "Mesure",
+            numeric_columns,
+            key=f"chart_y_{message_index}",
+        )
+        st.line_chart(data.sort_values(x_column), x=x_column, y=y_column)
+    else:
+        x_column = st.selectbox(
+            "Axe X",
+            numeric_columns,
+            key=f"chart_x_{message_index}",
+        )
+        y_choices = [column for column in numeric_columns if column != x_column]
+        y_column = st.selectbox(
+            "Axe Y",
+            y_choices,
+            key=f"chart_y_{message_index}",
+        )
+        st.scatter_chart(data, x=x_column, y=y_column)
+
+
+def _render_semantic_evidence(results) -> None:
+    if not results:
+        return
+
+    with st.expander("Commentaires clients retrouvés"):
+        for review in results:
+            metadata = [
+                f"Similarité : {review['similarity']:.3f}",
+                f"Avis : {review['review_id']}",
+                f"Commande : {review['order_id']}",
+            ]
+            st.caption(" · ".join(metadata))
+            st.text(review["review_text"])
+
+
+def _render_response(response, message_index: int) -> None:
+    intent_labels = {
+        "sql": "SQL",
+        "semantic": "Recherche sémantique",
+        "mixed": "SQL + recherche sémantique",
+    }
+    st.caption(
+        f"Traitement : {intent_labels.get(response.intent, 'Analyse')} · "
+        f"Statut : {response.status}"
     )
 
-    col_btn, col_empty = st.columns([1, 5])
-    submit_query = col_btn.button("Générer & Exécuter SQL", type="primary")
-
-    if submit_query:
-        if not user_query.strip():
-            st.warning("Veuillez saisir une question ou cliquer sur un exemple.")
+    if response.status == "clarification_required":
+        st.warning(response.explanation or "Merci de préciser votre question.")
+        return
+    if response.status == "security_rejected":
+        st.error("La requête a été refusée par le contrôle de sécurité SQL.")
+        return
+    if response.status == "unsupported":
+        st.info(response.explanation or "Cette question ne peut pas être traitée.")
+        return
+    if response.status == "error" and not response.answer:
+        if response.error_code and response.error_code.startswith("GEMINI_"):
+            st.error(
+                gemini_error_message(
+                    response.error_code,
+                    response.provider_status,
+                )
+            )
+        elif response.error_code == "INTENT_CLASSIFICATION_ERROR":
+            st.error(
+                "Gemini n'a pas fourni un classement de question valide. "
+                "Réessayez avec une question plus précise."
+            )
+        elif response.error_code == "SEMANTIC_TABLE_MISSING":
+            st.error(
+                "La table public.reviews_semantic n'est pas initialisée."
+            )
+        elif response.error_code == "PGVECTOR_UNAVAILABLE":
+            st.error("L'extension ou l'opérateur pgvector est indisponible.")
+        elif response.error_code == "SEMANTIC_DATABASE_UNAVAILABLE":
+            st.error("La base PostgreSQL de recherche est indisponible.")
+        elif response.error_code == "SEMANTIC_RESPONSE_INVALID":
+            st.error("Le service de recherche a retourné un résultat invalide.")
+        elif response.error_code == "SEMANTIC_SEARCH_ERROR":
+            st.error("La recherche dans les commentaires a échoué.")
+        elif response.error_code == "ANSWER_GENERATION_ERROR":
+            st.error(
+                "La recherche est terminée, mais Gemini n'a pas pu synthétiser "
+                "les résultats."
+            )
         else:
-            nl2sql_svc = get_nl2sql_service()
+            st.error(
+                response.explanation
+                or "Le traitement a échoué. Vérifiez les logs du backend."
+            )
+        return
+    if response.status == "execution_error" and not response.answer:
+        st.error("La requête SQL n'a pas pu être exécutée.")
 
-            with st.spinner("Analyse du schéma et génération de la requête SQL..."):
-                try:
-                    response = nl2sql_svc.process_question(user_query, execute=True)
-                except Exception as e:
-                    st.error(f"Erreur inattendue du backend : {e}")
-                    response = None
+    if response.status == "partial":
+        st.warning("Certains résultats ne sont pas disponibles.")
 
-            if response is not None:
-                if response.status == "success" and response.sql:
-                    st.success("Requête générée et exécutée avec succès !")
+    if response.answer:
+        st.markdown(response.answer)
+    elif response.explanation:
+        st.markdown(response.explanation)
 
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Lignes retournées", response.execution_result.row_count if response.execution_result else 0)
-                    m2.metric("Temps LLM", f"{response.llm_duration_seconds:.2f}s")
-                    m3.metric("Temps Exécution DB", f"{response.execution_result.execution_time_seconds:.3f}s" if response.execution_result else "0s")
-                    m4.metric("Temps Total", f"{response.total_duration_seconds:.2f}s")
+    execution = response.execution_result
+    if execution is not None:
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("Lignes retournées", execution.row_count)
+        metric_columns[1].metric(
+            "Temps SQL",
+            f"{execution.execution_time_seconds:.3f} s",
+        )
+        metric_columns[2].metric(
+            "Temps total",
+            f"{response.total_duration_seconds:.2f} s",
+        )
 
-                    st.subheader("Requête SQL générée")
-                    st.code(response.sql, language="sql")
+        if not execution.success:
+            st.warning("Les résultats SQL ne sont pas disponibles.")
+        elif execution.data is not None and not execution.data.empty:
+            st.dataframe(
+                execution.data,
+                width="stretch",
+                hide_index=True,
+            )
+            _render_chart(execution.data, message_index)
+        else:
+            st.info("La requête n'a retourné aucun enregistrement.")
 
-                    if response.explanation:
-                        st.info(f"**Explication :** {response.explanation}")
+    if response.sql and response.is_valid_sql:
+        with st.expander("Consulter la requête SQL"):
+            st.code(response.sql, language="sql")
 
-                    st.subheader("Résultats")
-                    if response.has_data:
-                        df_res = response.data
-                        st.dataframe(df_res, use_container_width=True)
+    _render_semantic_evidence(response.semantic_results or [])
 
-                        if len(df_res) > 1 and len(df_res.columns) == 2:
-                            col1, col2 = df_res.columns
-                            if pd.api.types.is_numeric_dtype(df_res[col2]) and not pd.api.types.is_numeric_dtype(df_res[col1]):
-                                st.subheader("Visualisation")
-                                st.bar_chart(df_res.set_index(col1))
-                            elif pd.api.types.is_numeric_dtype(df_res[col1]) and not pd.api.types.is_numeric_dtype(df_res[col2]):
-                                st.subheader("Visualisation")
-                                st.bar_chart(df_res.set_index(col2))
-                    else:
-                        st.warning("La requête n'a retourné aucun enregistrement.")
 
-                elif response.status == "clarification_required":
-                    st.warning(f"Précision requise : {response.explanation}")
-                elif response.status == "security_rejected":
-                    st.error(f"Requête rejetée par le contrôle de sécurité : {response.error_message}")
-                    if response.sql:
-                        st.code(response.sql, language="sql")
-                else:
-                    st.error(f"Erreur : {response.error_message or response.explanation}")
-                    if response.sql:
-                        st.code(response.sql, language="sql")
+def _append_question(question: str) -> None:
+    messages = st.session_state.conversation
+    messages.append({"role": "user", "content": question})
+    st.session_state.message_counter += 1
+    message_id = st.session_state.message_counter
 
-# =====================================================
-# ONGLET 2 : IMPORT DE FICHIER CSV (FONCTIONNALITÉ EXISTANTE PRÉSERVÉE)
-# =====================================================
-with tab_csv:
-    st.header("Import et profilage de fichier CSV")
-    file = st.file_uploader("Choisir un CSV", type=["csv"], key="csv_inspector")
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        try:
+            with st.spinner("Analyse de votre question..."):
+                response = get_question_orchestrator().process_question(
+                    question,
+                    execute=True,
+                )
+            _render_response(response, message_id)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "response": response,
+                    "chart_id": message_id,
+                }
+            )
+        except Exception as error:
+            logger.error(
+                "Question orchestration failed: exception=%s",
+                type(error).__name__,
+            )
+            message = (
+                "Le service d'analyse est temporairement indisponible. "
+                "Veuillez réessayer."
+            )
+            st.error(message)
+            messages.append({"role": "assistant", "content": message})
+
+
+st.title("DataSense — Assistant d'analyse Olist")
+st.caption(
+    "Posez vos questions en français ou en anglais sur les données de commandes "
+    "et les commentaires clients."
+)
+
+with st.sidebar:
+    st.title("DATASENSE")
+    st.caption("Analysez vos données en langage naturel.")
+    st.divider()
+
+    st.subheader("État du service")
+    database_available, vector_available, semantic_readiness = _database_status()
+    if database_available:
+        st.success("Base de données disponible")
+        if not vector_available:
+            st.warning("Extension de recherche vectorielle non détectée")
+        elif semantic_readiness is None:
+            st.warning("État de la recherche sémantique non vérifié")
+        elif not semantic_readiness.table_exists:
+            st.warning("Table public.reviews_semantic absente")
+        elif not semantic_readiness.has_embeddings:
+            st.warning("Table sémantique présente, embeddings absents")
+        elif semantic_readiness.embedding_dimension != 384:
+            st.warning(
+                "Dimension des embeddings incorrecte : "
+                f"{semantic_readiness.embedding_dimension or 'inconnue'}"
+            )
+        else:
+            st.success("Recherche sémantique prête (embeddings 384D)")
+    else:
+        st.warning("Base de données momentanément indisponible")
+
+    st.caption(f"Modèle principal configuré : {settings.llm.model}")
+    if st.button("Tester Gemini", use_container_width=True):
+        try:
+            with st.spinner("Vérification de Gemini..."):
+                status = get_llm_service().test_connectivity()
+            if status["success"]:
+                st.success(f"Gemini est disponible via {status['model']}.")
+            else:
+                st.warning(
+                    gemini_error_message(
+                        status.get("error_code"),
+                        status.get("provider_status"),
+                    )
+                )
+        except Exception as error:
+            logger.warning(
+                "Gemini connectivity check failed: exception=%s",
+                type(error).__name__,
+            )
+            st.warning("Gemini est momentanément indisponible.")
+
+    st.divider()
+    if st.button(
+        "Nouvelle conversation",
+        key="new_conversation",
+        type="primary",
+        width="stretch",
+    ):
+        st.session_state.conversation = []
+        st.rerun()
+
+    st.subheader("Questions récentes")
+    user_messages = [
+        message["content"]
+        for message in st.session_state.get("conversation", [])
+        if message["role"] == "user"
+    ]
+    if user_messages:
+        for question in reversed(user_messages[-8:]):
+            st.caption(f"• {question}")
+    else:
+        st.caption("Votre historique apparaîtra ici.")
+
+if "conversation" not in st.session_state:
+    st.session_state.conversation = []
+if "message_counter" not in st.session_state:
+    st.session_state.message_counter = 0
+
+for index, message in enumerate(st.session_state.conversation):
+    with st.chat_message(message["role"]):
+        if message["role"] == "user":
+            st.markdown(message["content"])
+        elif "response" in message:
+            _render_response(
+                message["response"],
+                message.get("chart_id", index),
+            )
+        else:
+            st.markdown(message["content"])
+
+if not st.session_state.conversation:
+    st.info("Exemples de questions")
+    examples = [
+        "Combien de commandes ont été livrées en 2018 ?",
+        "Que pensent les clients de la livraison ?",
+        "Quel est le chiffre d'affaires et que disent les avis ?",
+    ]
+    example_columns = st.columns(len(examples))
+    selected_question = None
+    for index, example in enumerate(examples):
+        if example_columns[index].button(
+            example,
+            key=f"example_{index}",
+            width="stretch",
+        ):
+            selected_question = example
+            break
+else:
+    selected_question = None
+
+chat_question = st.chat_input("Posez votre question à DataSense...")
+if chat_question:
+    selected_question = chat_question
+
+if selected_question:
+    _append_question(selected_question.strip())
+
+
+with st.expander("Import et profilage CSV"):
+    st.write("Inspectez un fichier local sans l'envoyer au pipeline de questions.")
+    file = st.file_uploader("Choisir un fichier CSV", type=["csv"], key="csv_inspector")
 
     if file:
-        df = pd.read_csv(file)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Lignes", f"{len(df):,}")
-        c2.metric("Colonnes", df.shape[1])
-        c3.metric("Doublons", int(df.duplicated().sum()))
+        try:
+            data = pd.read_csv(file)
+        except (UnicodeDecodeError, pd.errors.ParserError, ValueError):
+            st.error("Le fichier CSV n'a pas pu être lu. Vérifiez son format.")
+        else:
+            metric_columns = st.columns(3)
+            metric_columns[0].metric("Lignes", f"{len(data):,}")
+            metric_columns[1].metric("Colonnes", data.shape[1])
+            metric_columns[2].metric("Doublons", int(data.duplicated().sum()))
 
-        st.subheader("Aperçu")
-        st.dataframe(df.head(50), use_container_width=True)
+            st.subheader("Aperçu")
+            st.dataframe(data.head(50), width="stretch")
 
-        st.subheader("Types et valeurs manquantes")
-        info = pd.DataFrame({
-            "type": df.dtypes.astype(str),
-            "manquantes": df.isna().sum(),
-            "% manquantes": (df.isna().mean() * 100).round(2),
-        })
-        st.dataframe(info, use_container_width=True)
+            st.subheader("Types et valeurs manquantes")
+            info = pd.DataFrame(
+                {
+                    "type": data.dtypes.astype(str),
+                    "manquantes": data.isna().sum(),
+                    "% manquantes": (data.isna().mean() * 100).round(2),
+                }
+            )
+            st.dataframe(info, width="stretch")
